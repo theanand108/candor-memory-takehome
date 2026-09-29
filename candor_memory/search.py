@@ -24,10 +24,7 @@ _NUMBER_WORDS = {
 
 def tokenize(text: str) -> list[str]:
     tokens = [t for t in _TOKEN.findall(text.lower()) if t not in _STOP]
-    expanded: list[str] = []
-    for token in tokens:
-        expanded.append(_NUMBER_WORDS.get(token, token))
-    return expanded
+    return [_NUMBER_WORDS.get(token, token) for token in tokens]
 
 
 def _stem(token: str) -> str:
@@ -69,9 +66,6 @@ class LexicalIndex:
     source metadata. Stage 2 adds record-level evidence. Stage 3 performs a
     narrow contextual expansion around strong transcript/thread hits instead
     of spreading one good match across every neighbouring filler segment.
-
-    This mirrors a common RAG pattern: retrieve broadly, then use document
-    context to improve the final ranking. citeturn1search0turn1search5
     """
 
     def __init__(self, units: list[MemoryUnit]):
@@ -79,7 +73,7 @@ class LexicalIndex:
         self.by_id = {u.id: u for u in units}
         self.tokens = {u.id: _norm_tokens(u.searchable_text()) for u in units}
         self.raw_tokens = {u.id: set(tokenize(u.searchable_text())) for u in units}
-        self.doc_len = {u.id: len(tokens) for u, tokens in ((u, self.tokens[u.id]) for u in units)}
+        self.doc_len = {u.id: len(self.tokens[u.id]) for u in units}
         self.avgdl = sum(self.doc_len.values()) / max(1, len(self.doc_len))
         self.df: Counter[str] = Counter()
         for tokens in self.tokens.values():
@@ -126,8 +120,8 @@ class LexicalIndex:
         counts = Counter(tokens)
         dl = len(tokens)
         avg = max(1.0, sum(map(len, self.record_tokens.values())) / max(1, len(self.record_tokens)))
-        score = 0.0
         record_sets = {rid: set(values) for rid, values in self.record_tokens.items()}
+        score = 0.0
         for term in set(q):
             tf = counts.get(term, 0)
             if not tf:
@@ -153,7 +147,7 @@ class LexicalIndex:
         direct: dict[str, float] = defaultdict(float)
         candidates = self.units if source is None else [u for u in self.units if u.source == source]
 
-        # ---------- Stage 1: direct unit retrieval ----------
+        # Stage 1: direct unit retrieval.
         for unit in candidates:
             uid = unit.id
             searchable = unit.searchable_text().lower()
@@ -163,8 +157,6 @@ class LexicalIndex:
             if len(query_lower) >= 5 and query_lower in searchable:
                 scores[uid] += 5.0
 
-            # Exact multi-word phrase matches are much stronger than isolated
-            # words. This helps questions containing product names and dates.
             unit_phrases = _phrases(tokens)
             phrase_hits = len(query_phrases & unit_phrases)
             if phrase_hits:
@@ -194,32 +186,22 @@ class LexicalIndex:
 
             direct[uid] = scores[uid]
 
-        # ---------- Stage 2: record-level context ----------
-        # A question may mention a topic once while the answer is another
-        # segment in the same meeting/thread. Give the record a signal, but do
-        # not blindly boost every member.
+        # Stage 2: record-level context. Strong units receive record evidence;
+        # weak filler does not automatically inherit it.
         record_scores = {rid: self._record_bm25(rid, q) for rid in self.record_units}
         for unit in candidates:
             rs = record_scores.get(unit.record_id, 0.0)
-            if rs <= 0:
-                continue
             own = direct.get(unit.id, 0.0)
-            # Strong direct hits get a little record context. Weak/filler units
-            # only get a contextual path in Stage 3.
-            if own > 1.0:
+            if rs > 0 and own > 1.0:
                 scores[unit.id] += min(2.0, rs * 0.45)
 
-        # ---------- Stage 3: narrow local context expansion ----------
-        # Meetings are diarized into tiny segments. The question may retrieve
-        # the setup line while the answer is 1-6 segments away. Expand around
-        # strong seeds, but require the neighbour to contain either query terms
-        # or meaningful overlap with the seed; this avoids flooding top-10 with
-        # "Yeah", "Okay", "And?" filler.
+        # Stage 3: narrow local context expansion. This is intentionally much
+        # stricter than the previous sibling boost: a neighbour must share a
+        # query term or a meaningful term with the strong seed.
         for rid, members in self.record_units.items():
-            eligible = [m for m in members if m.id in direct]
-            seeds = sorted(eligible, key=lambda m: direct[m.id], reverse=True)[:3]
+            seeds = sorted(members, key=lambda m: direct.get(m.id, 0.0), reverse=True)[:3]
             for seed in seeds:
-                seed_score = direct[seed.id]
+                seed_score = direct.get(seed.id, 0.0)
                 if seed_score < 1.8:
                     continue
                 seed_tokens = set(self.tokens[seed.id])
@@ -231,8 +213,6 @@ class LexicalIndex:
                         if idx < 0 or idx >= len(members):
                             continue
                         neighbour = members[idx]
-                        if neighbour.id not in direct:
-                            continue
                         if neighbour.id == seed.id:
                             continue
                         neighbour_tokens = set(self.tokens[neighbour.id])
