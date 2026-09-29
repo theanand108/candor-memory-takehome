@@ -24,6 +24,9 @@ def load_units(data_dir: str | Path) -> list[MemoryUnit]:
 
     Delivery/availability time is deliberately preserved separately from event
     semantics because the evaluator answers questions at an `as_of` moment.
+    ``record_id`` groups naturally multi-message records (meetings, Slack
+    threads, Gmail threads, and ChatGPT conversations) so retrieval can use
+    context without losing the original citable unit id.
     """
     root = Path(data_dir)
     units: list[MemoryUnit] = []
@@ -72,18 +75,19 @@ def load_units(data_dir: str | Path) -> list[MemoryUnit]:
             text = item.get("text", "")
             unit_type = "edit"
         else:
-            user = users.get(item.get("user"), {})
             text = item.get("text", "")
             unit_type = "message"
         user = users.get(item.get("user"), {})
+        thread_parent = item.get("thread_parent_id")
+        record_id = thread_parent or item["id"]
         units.append(MemoryUnit(
-            id=item["id"], record_id=item["id"], source="slack", unit_type=unit_type,
+            id=item["id"], record_id=record_id, source="slack", unit_type=unit_type,
             available_at=parse_dt(item["ts"]), text=text,
             metadata={
                 "author": user.get("real_name") or user.get("name") or item.get("user") or item.get("bot_name"),
                 "author_id": item.get("user"), "channel": channel.get("name") or item.get("channel_id"),
                 "channel_id": item.get("channel_id"), "subtype": subtype,
-                "target_id": item.get("target_id"), "thread_parent_id": item.get("thread_parent_id"),
+                "target_id": item.get("target_id"), "thread_parent_id": thread_parent,
             },
         ))
 
@@ -92,10 +96,11 @@ def load_units(data_dir: str | Path) -> list[MemoryUnit]:
         header = f"From {item.get('from', '')} To {', '.join(item.get('to', []))}"
         if item.get("cc"):
             header += f" Cc {', '.join(item['cc'])}"
+        thread_id = item.get("thread_id") or item["id"]
         units.append(MemoryUnit(
-            id=item["id"], record_id=item["id"], source="gmail", unit_type="email",
+            id=item["id"], record_id=thread_id, source="gmail", unit_type="email",
             available_at=parse_dt(item["date"]), text=f"{header} | {item.get('subject', '')}\n{body}",
-            metadata={"subject": item.get("subject"), "author": item.get("from"), "thread_id": item.get("thread_id")},
+            metadata={"subject": item.get("subject"), "author": item.get("from"), "thread_id": thread_id},
         ))
 
     for item in _jsonl(root / "connectors/google_calendar/events.jsonl"):
