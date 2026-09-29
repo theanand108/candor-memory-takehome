@@ -5,8 +5,8 @@ import sys
 from pathlib import Path
 
 from .answering import answer_from_evidence
+from .hybrid import HybridIndex
 from .ingestion import load_units, parse_dt
-from .search import LexicalIndex
 from .temporal import build_temporal_view
 
 
@@ -18,14 +18,14 @@ def run_memory(input_path: str, output_path: str, data_dir: str = "data") -> Non
 
     # Build one temporal index per as_of so all retrieval candidates are
     # guaranteed to respect the evaluator's time boundary.
-    indexes: dict[str, tuple[list, LexicalIndex]] = {}
+    indexes: dict[str, tuple[list, HybridIndex]] = {}
     outputs = []
     for question in questions:
         as_of = parse_dt(question["as_of"])
         key = question["as_of"]
         if key not in indexes:
             visible = build_temporal_view(units, as_of)
-            indexes[key] = (visible, LexicalIndex(visible))
+            indexes[key] = (visible, HybridIndex(visible))
         visible, index = indexes[key]
         hits = index.search(question["question"], limit=20)
         ranked = [hit.unit for hit in hits]
