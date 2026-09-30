@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 
+from candor_memory.hybrid import HybridIndex
 from candor_memory.ingestion import load_units, parse_dt
-from candor_memory.search import LexicalIndex
 from candor_memory.temporal import build_temporal_view
 
 
@@ -25,20 +24,28 @@ def main() -> None:
 
     wanted = set(args.ids)
     units = load_units(args.data)
-    by_id = {u.id: u for u in units}
 
     with open(args.gold, encoding="utf-8") as f:
         questions = [json.loads(line) for line in f if line.strip()]
 
+    # Cache one hybrid index per as_of timestamp, matching the production CLI.
+    indexes: dict[str, HybridIndex] = {}
     for q in questions:
         if wanted and q["id"] not in wanted:
             continue
-        visible = build_temporal_view(units, parse_dt(q["as_of"]))
-        index = LexicalIndex(visible)
+
+        as_of = q["as_of"]
+        if as_of not in indexes:
+            visible = build_temporal_view(units, parse_dt(as_of))
+            print(f"Building hybrid index for as_of={as_of}...", flush=True)
+            indexes[as_of] = HybridIndex(visible)
+
+        index = indexes[as_of]
         hits = index.search(q["question"], limit=20)
         ranked = [h.unit for h in hits]
         needed = flatten_needed(q.get("needed", []))
         found = needed & {u.id for u in ranked[:10]}
+
         if wanted or len(found) != len(needed):
             print("=" * 100)
             print(q["id"], q["category"])
