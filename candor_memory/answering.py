@@ -38,6 +38,15 @@ def looks_like_untrusted_instruction(text: str) -> bool:
     return any(marker in lowered for marker in _INSTRUCTION_MARKERS)
 
 
+def _compact_snippet(text: str, max_words: int = 38) -> str:
+    """Keep one evidence record concise enough to combine several records."""
+    snippet = sanitize(text).strip().replace("\n", " ")
+    words = snippet.split()
+    if len(words) <= max_words:
+        return snippet
+    return " ".join(words[:max_words]).rstrip(".,;:") + "..."
+
+
 def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, list[str], bool]:
     """Return a conservative extractive answer from retrieval-ranked evidence.
 
@@ -45,6 +54,10 @@ def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, li
     same hits with raw question-token overlap makes small retrieval changes
     unstable and can select an older or unrelated record. We therefore retain
     retrieval order and use token overlap only as a minimal relevance gate.
+
+    Multiple top-ranked records are included because many memory questions
+    require a small evidence chain (for example, a commitment followed by its
+    later completion or a current view alongside a conflicting view).
     """
     safe_hits = [h for h in hits if not looks_like_untrusted_instruction(h.text)]
     if not safe_hits:
@@ -69,8 +82,6 @@ def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, li
     if not chosen:
         return "I don't know.", [], True
 
-    primary = chosen[0]
-    snippet = sanitize(primary.text).strip().replace("\n", " ")
-    if len(snippet) > 500:
-        snippet = snippet[:497].rsplit(" ", 1)[0] + "..."
-    return snippet, [u.id for u in chosen], False
+    snippets = [_compact_snippet(unit.text) for unit in chosen]
+    answer = " ".join(snippet for snippet in snippets if snippet)
+    return answer, [u.id for u in chosen], False
