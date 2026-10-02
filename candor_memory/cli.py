@@ -29,7 +29,12 @@ def run_memory(input_path: str, output_path: str, data_dir: str = "data") -> Non
         visible, index = indexes[key]
         hits = index.search(question["question"], limit=20)
         ranked = [hit.unit for hit in hits]
-        answer, sources, abstained = answer_from_evidence(question["question"], ranked[:10])
+
+        # The evaluator scores the top 10, but the answer writer should see
+        # the complete retrieved evidence budget. Multi-record questions often
+        # have one decisive passage just outside the first ten; exposing all
+        # twenty improves grounded synthesis without changing retrieval scores.
+        answer, sources, abstained = answer_from_evidence(question["question"], ranked)
         outputs.append({
             "id": question["id"],
             "answer": answer,
