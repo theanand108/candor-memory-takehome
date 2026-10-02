@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .models import MemoryUnit
-from .search import LexicalIndex, SearchHit
+from .search import LexicalIndex, SearchHit, tokenize
 from .semantic import SemanticIndex
 
 
@@ -49,7 +49,6 @@ def _looks_like_untrusted_instruction(text: str) -> bool:
 
 def _date_keys(text: str) -> set[str]:
     keys: set[str] = set()
-
     for match in re.finditer(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", text):
         year, month, day = map(int, match.groups())
         try:
@@ -67,8 +66,18 @@ def _date_keys(text: str) -> set[str]:
             keys.add(datetime(int(year), _MONTHS[month.lower()], int(day)).date().isoformat())
         except ValueError:
             pass
-
     return keys
+
+
+def _query_tokens(query: str) -> set[str]:
+    return set(tokenize(query))
+
+
+def _expansion_relevance(query_tokens: set[str], unit: MemoryUnit) -> tuple[int, int]:
+    unit_tokens = set(tokenize(f"{unit.text} {unit.id} {unit.record_id}"))
+    overlap = len(query_tokens & unit_tokens)
+    all_terms = 1 if query_tokens and query_tokens.issubset(unit_tokens) else 0
+    return overlap, all_terms
 
 
 class HybridIndex:
@@ -80,6 +89,7 @@ class HybridIndex:
     SEMANTIC_ANCHOR_LIMIT = 10
     LEXICAL_ANCHOR_BONUS = 0.0065
     SEMANTIC_ANCHOR_BONUS = 0.0045
+    MAX_EXPANDED_SIBLINGS_PER_RECORD = 3
 
     def __init__(self, units: list[MemoryUnit]):
         self.units = units
@@ -114,15 +124,10 @@ class HybridIndex:
             if hit.unit.id not in semantic_ids:
                 fused[hit.unit.id] = fused.get(hit.unit.id, 0.0) + self.LEXICAL_ANCHOR_BONUS
 
-        # The reciprocal-rank sum can otherwise let several merely related
-        # lexical records crowd out a high-quality semantic-only hit. Preserve
-        # a small semantic frontier as an anchor; later evidence expansion can
-        # still supply the precise neighboring records.
         lexical_ids = {hit.unit.id for hit in lexical_hits}
         for rank, hit in enumerate(semantic_hits[: self.SEMANTIC_ANCHOR_LIMIT], start=1):
             if hit.unit.id not in lexical_ids:
                 fused[hit.unit.id] = fused.get(hit.unit.id, 0.0) + self.SEMANTIC_ANCHOR_BONUS
-
         return fused
 
     def _expand_evidence(self, query: str, fused: dict[str, float]) -> dict[str, float]:
@@ -136,12 +141,31 @@ class HybridIndex:
             if not _looks_like_untrusted_instruction(self.by_id[uid].text)
         ]
         expanded = dict(fused)
+        q_tokens = _query_tokens(query)
+        expanded_record_counts: dict[str, int] = {}
 
         for seed in seeds:
-            for unit in self.by_record.get(seed.record_id, []):
-                if unit.id == seed.id or _looks_like_untrusted_instruction(unit.text):
+            siblings = [
+                unit for unit in self.by_record.get(seed.record_id, [])
+                if unit.id != seed.id and not _looks_like_untrusted_instruction(unit.text)
+            ]
+            siblings.sort(
+                key=lambda unit: (
+                    _expansion_relevance(q_tokens, unit),
+                    -unit.available_at.timestamp(),
+                    unit.id,
+                ),
+                reverse=True,
+            )
+            record_count = expanded_record_counts.get(seed.record_id, 0)
+            for unit in siblings:
+                if record_count >= self.MAX_EXPANDED_SIBLINGS_PER_RECORD:
+                    break
+                if unit.id in fused:
                     continue
                 expanded[unit.id] = max(expanded.get(unit.id, 0.0), fused[seed.id] * 0.65)
+                record_count += 1
+            expanded_record_counts[seed.record_id] = record_count
 
             target_id = seed.metadata.get("target_id")
             if target_id and target_id in self.by_id:
@@ -168,13 +192,11 @@ class HybridIndex:
                     continue
                 if date_keys & _date_keys(unit.text):
                     expanded[unit.id] = max(expanded.get(unit.id, 0.0), 0.0105)
-
         return expanded
 
     def search(self, query: str, limit: int = 20) -> list[HybridHit]:
         fused = self._base_search(query)
         fused = self._expand_evidence(query, fused)
-
         ranked = sorted(
             fused.items(),
             key=lambda item: (-item[1], self.by_id[item[0]].available_at, item[0]),
