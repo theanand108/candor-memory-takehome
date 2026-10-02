@@ -74,18 +74,12 @@ def _date_keys(text: str) -> set[str]:
 
 
 class HybridIndex:
-    """Fuse lexical and semantic retrieval, then expand evidence chains.
-
-    The first stage is ordinary lexical + dense retrieval.  The second stage
-    deliberately retrieves *related evidence* that a single natural-language
-    query may not mention verbatim: other segments in the same record/thread,
-    Slack edit targets, and calendar events occurring on a date discovered in
-    a seed result.  This keeps the semantic model responsible for recall while
-    deterministic relationship logic handles multi-hop structure.
-    """
+    """Fuse lexical and semantic retrieval, then expand evidence chains."""
 
     RRF_K = 60.0
     CANDIDATE_LIMIT = 60
+    LEXICAL_ANCHOR_LIMIT = 5
+    LEXICAL_ANCHOR_BONUS = 0.0035
 
     def __init__(self, units: list[MemoryUnit]):
         self.units = units
@@ -114,6 +108,17 @@ class HybridIndex:
             fused[hit.unit.id] = fused.get(hit.unit.id, 0.0) + 1.0 / (self.RRF_K + rank)
         for rank, hit in enumerate(semantic_hits, start=1):
             fused[hit.unit.id] = fused.get(hit.unit.id, 0.0) + 1.0 / (self.RRF_K + rank)
+
+        # Protect a small number of strong lexical-only anchors. These are
+        # useful when a query contains exact entities/phrases that dense
+        # retrieval misses. The bonus is deliberately small and applies only
+        # to lexical top-5 results absent from the semantic candidate set, so
+        # it does not globally tilt hybrid retrieval back toward lexical search.
+        semantic_ids = {hit.unit.id for hit in semantic_hits}
+        for rank, hit in enumerate(lexical_hits[: self.LEXICAL_ANCHOR_LIMIT], start=1):
+            if hit.unit.id not in semantic_ids:
+                fused[hit.unit.id] = fused.get(hit.unit.id, 0.0) + self.LEXICAL_ANCHOR_BONUS
+
         return fused
 
     def _expand_evidence(self, query: str, fused: dict[str, float]) -> dict[str, float]:
@@ -129,11 +134,6 @@ class HybridIndex:
         ]
         expanded = dict(fused)
 
-        # 1. Same record/thread: meetings, Slack threads, Gmail threads and
-        # other grouped records often split one fact across many short units.
-        # Keep this relationship useful without allowing a single seed to
-        # flood the final ranking with loosely related sibling segments.
-        # Never create new retrieval paths from instruction-bearing content.
         for seed in seeds:
             for unit in self.by_record.get(seed.record_id, []):
                 if unit.id == seed.id or _looks_like_untrusted_instruction(unit.text):
@@ -164,10 +164,6 @@ class HybridIndex:
                             fused[seed.id] * 0.65,
                         )
 
-        # 2. Date hop: if a seed mentions a concrete date, retrieve calendar
-        # events on that date. This handles questions such as "what is on my
-        # calendar the day I fly to Denver?" without asking the embedding model
-        # to perform symbolic date reasoning.
         date_keys: set[str] = set()
         for seed in seeds:
             date_keys.update(_date_keys(seed.text))
