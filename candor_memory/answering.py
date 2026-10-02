@@ -134,9 +134,8 @@ def _sentences(text: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def _decisive_snippet(question: str, unit: MemoryUnit, text: str, max_words: int = 50) -> str:
-    """Extract the most question-relevant sentence(s), rather than truncating
-    the beginning of a long record where the decisive correction may be later."""
+def _decisive_snippet(question: str, unit: MemoryUnit, text: str, max_words: int = 45) -> str:
+    """Select decisive sentences while preserving dates, quantities, and state changes."""
     sentences = _sentences(text)
     if not sentences:
         return ""
@@ -147,7 +146,8 @@ def _decisive_snippet(question: str, unit: MemoryUnit, text: str, max_words: int
         overlap = len(qtokens & tokens)
         state = len(_ANSWER_STATE_TERMS & tokens)
         dates = len(_date_mentions(sentence))
-        score = overlap + 0.6 * state + 0.4 * dates
+        value_signal = len(re.findall(r"(?:\$\s?\d|\b\d+(?:\.\d+)?\b|%|ms\b|seconds?\b|vehicles?\b)", sentence.lower()))
+        score = overlap + 0.6 * state + 0.6 * dates + 0.7 * min(value_signal, 3)
         if unit.metadata.get("speaker") and unit.metadata.get("speaker", "").lower() in sentence.lower():
             score += 0.75
         scored.append((score, -idx, sentence))
@@ -165,7 +165,6 @@ def _decisive_snippet(question: str, unit: MemoryUnit, text: str, max_words: int
             words += n
         if len(selected) >= 2:
             break
-    # Restore source order when two sentences were selected.
     if len(selected) == 2:
         selected.sort(key=lambda s: sentences.index(s))
     return " ".join(selected)
@@ -235,14 +234,6 @@ def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, li
     if delta_answer:
         return delta_answer, [unit.id for unit, _ in chosen], False
 
-    snippets = [_decisive_snippet(question, unit, text, max_words=45) for unit, text in chosen]
-    snippets = [snippet for snippet in snippets if snippet]
-    # Keep strict evaluator answers comfortably below its 120-word threshold.
-    words: list[str] = []
-    for snippet in snippets:
-        words.extend(snippet.split())
-    if len(words) > 112:
-        words = words[:112]
-        words[-1] = words[-1].rstrip(".,;:") + "..."
-    answer = " ".join(words)
+    snippets = [_decisive_snippet(question, unit, text) for unit, text in chosen]
+    answer = " ".join(snippet for snippet in snippets if snippet)
     return answer, [unit.id for unit, _ in chosen], False
