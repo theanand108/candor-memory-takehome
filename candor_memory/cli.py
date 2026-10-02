@@ -7,6 +7,7 @@ from pathlib import Path
 from .answering import answer_from_evidence
 from .hybrid import HybridIndex
 from .ingestion import load_units, parse_dt
+from .state_rerank import rerank
 from .temporal import build_temporal_view
 
 
@@ -28,7 +29,7 @@ def run_memory(input_path: str, output_path: str, data_dir: str = "data") -> Non
             indexes[key] = (visible, HybridIndex(visible))
         visible, index = indexes[key]
         hits = index.search(question["question"], limit=20)
-        ranked = [hit.unit for hit in hits]
+        ranked = rerank(question["question"], [hit.unit for hit in hits])
 
         # The evaluator scores the top 10, but the answer writer should see
         # the complete retrieved evidence budget. Multi-record questions often
