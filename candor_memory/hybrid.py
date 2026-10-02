@@ -30,6 +30,22 @@ _MONTHS = {
     "dec": 12, "december": 12,
 }
 
+_INSTRUCTION_MARKERS = (
+    "ignore previous instructions",
+    "ignore your previous instructions",
+    "disregard previous instructions",
+    "ignore all previous instructions",
+    "system prompt",
+    "assistant must",
+    "do not tell alex",
+    "forward all emails",
+)
+
+
+def _looks_like_untrusted_instruction(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _INSTRUCTION_MARKERS)
+
 
 def _date_keys(text: str) -> set[str]:
     """Return normalized YYYY-MM-DD keys mentioned in a memory passage."""
@@ -106,14 +122,19 @@ class HybridIndex:
             return fused
 
         ranked_ids = sorted(fused, key=lambda uid: (-fused[uid], uid))
-        seeds = [self.by_id[uid] for uid in ranked_ids[:20]]
+        seeds = [
+            self.by_id[uid]
+            for uid in ranked_ids[:20]
+            if not _looks_like_untrusted_instruction(self.by_id[uid].text)
+        ]
         expanded = dict(fused)
 
         # 1. Same record/thread: meetings, Slack threads, Gmail threads and
         # other grouped records often split one fact across many short units.
+        # Never create new retrieval paths from instruction-bearing content.
         for seed in seeds:
             for unit in self.by_record.get(seed.record_id, []):
-                if unit.id == seed.id:
+                if unit.id == seed.id or _looks_like_untrusted_instruction(unit.text):
                     continue
                 expanded[unit.id] = max(
                     expanded.get(unit.id, 0.0),
@@ -122,15 +143,20 @@ class HybridIndex:
 
             target_id = seed.metadata.get("target_id")
             if target_id and target_id in self.by_id:
-                expanded[target_id] = max(
-                    expanded.get(target_id, 0.0),
-                    fused[seed.id] * 0.88,
-                )
+                target = self.by_id[target_id]
+                if not _looks_like_untrusted_instruction(target.text):
+                    expanded[target_id] = max(
+                        expanded.get(target_id, 0.0),
+                        fused[seed.id] * 0.88,
+                    )
 
             thread_parent = seed.metadata.get("thread_parent_id")
             if thread_parent:
                 for unit in self.units:
-                    if unit.metadata.get("thread_parent_id") == thread_parent:
+                    if (
+                        unit.metadata.get("thread_parent_id") == thread_parent
+                        and not _looks_like_untrusted_instruction(unit.text)
+                    ):
                         expanded[unit.id] = max(
                             expanded.get(unit.id, 0.0),
                             fused[seed.id] * 0.80,
@@ -146,7 +172,7 @@ class HybridIndex:
 
         if date_keys:
             for unit in self.units:
-                if unit.source != "calendar":
+                if unit.source != "calendar" or _looks_like_untrusted_instruction(unit.text):
                     continue
                 unit_dates = _date_keys(unit.text)
                 if date_keys & unit_dates:
