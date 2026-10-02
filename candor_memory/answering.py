@@ -25,6 +25,17 @@ _INSTRUCTION_MARKERS = (
     "forward all emails",
 )
 
+# These words carry little topical information. Removing them makes the
+# relevance gate useful for questions such as "What is Dana's salary?": a
+# record merely mentioning Dana should not be treated as evidence about salary.
+_QUESTION_STOPWORDS = {
+    "a", "an", "and", "are", "be", "did", "do", "does", "for", "from",
+    "how", "i", "in", "is", "it", "me", "my", "of", "on", "or", "the",
+    "this", "to", "was", "were", "what", "when", "where", "which", "who",
+    "why", "will", "with", "you", "your", "we", "our", "they", "their",
+    "he", "she", "them", "his", "her", "than", "then", "still", "just",
+}
+
 
 def sanitize(text: str) -> str:
     result = text
@@ -38,8 +49,8 @@ def looks_like_untrusted_instruction(text: str) -> bool:
     return any(marker in lowered for marker in _INSTRUCTION_MARKERS)
 
 
-def _compact_snippet(text: str, max_words: int = 38) -> str:
-    """Keep one evidence record concise enough to combine several records."""
+def _compact_snippet(text: str, max_words: int = 26) -> str:
+    """Keep evidence concise enough to combine several relevant records."""
     snippet = sanitize(text).strip().replace("\n", " ")
     words = snippet.split()
     if len(words) <= max_words:
@@ -51,20 +62,26 @@ def _content_tokens(text: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", text.lower()))
 
 
-def _has_structured_anchor(question: str, text: str) -> bool:
-    """Require both sides of a question's explicit 'about' relation.
+def _question_content_tokens(question: str) -> set[str]:
+    return {
+        token
+        for token in _content_tokens(question)
+        if token not in _QUESTION_STOPWORDS and len(token) >= 3
+    }
 
-    This prevents an unrelated record about the right entity from becoming an
-    answer merely because it shares one broad subject token. It is especially
-    useful for questions asking what an entity said about a specific topic.
-    """
+
+def _has_structured_anchor(question: str, text: str) -> bool:
+    """Require both sides of a question's explicit 'about' relation."""
     lowered = question.lower()
     if " about " not in lowered:
         return True
 
     before, after = lowered.split(" about ", 1)
-    before_tokens = {t for t in _content_tokens(before) if len(t) >= 4}
-    after_tokens = {t for t in _content_tokens(after) if len(t) >= 3}
+    before_tokens = {
+        t for t in _question_content_tokens(before)
+        if len(t) >= 4
+    }
+    after_tokens = _question_content_tokens(after)
     text_tokens = _content_tokens(text)
 
     return bool(before_tokens & text_tokens) and bool(after_tokens & text_tokens)
@@ -73,39 +90,51 @@ def _has_structured_anchor(question: str, text: str) -> bool:
 def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, list[str], bool]:
     """Return a conservative extractive answer from retrieval-ranked evidence.
 
-    Retrieval already combines lexical and semantic relevance. Re-ranking the
-    same hits with raw question-token overlap makes small retrieval changes
-    unstable and can select an older or unrelated record. We therefore retain
-    retrieval order and use token overlap only as a minimal relevance gate.
-
-    Multiple top-ranked records are included because many memory questions
-    require a small evidence chain (for example, a commitment followed by its
-    later completion or a current view alongside a conflicting view).
+    Retrieval order remains the primary signal, but an evidence record now
+    needs meaningful topical overlap with the question. This prevents a record
+    that merely names the right person/project from answering a different
+    question (for example, Dana's salary), while allowing several records to
+    form the small evidence chains required by the benchmark.
     """
     safe_hits = [h for h in hits if not looks_like_untrusted_instruction(h.text)]
     if not safe_hits:
         return "I don't know.", [], True
 
-    qtokens = _content_tokens(question)
+    qtokens = _question_content_tokens(question)
+    candidates: list[tuple[int, int, MemoryUnit]] = []
+
+    for rank, unit in enumerate(safe_hits):
+        words = _content_tokens(unit.text)
+        overlap = len(qtokens & words)
+        if overlap == 0 or not _has_structured_anchor(question, unit.text):
+            continue
+
+        # One weak overlap is usually an entity-only match. Require either two
+        # topical anchors or a single distinctive long token.
+        strong_single = any(token in words for token in qtokens if len(token) >= 7)
+        if overlap < 2 and not strong_single:
+            continue
+
+        candidates.append((overlap, -rank, unit))
+
+    if not candidates:
+        return "I don't know.", [], True
+
+    # Prefer records with more direct topical overlap, breaking ties by the
+    # retrieval rank produced by the hybrid index. Keep a compact evidence
+    # chain so multi-hop/disagreement questions retain both sides.
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
     chosen: list[MemoryUnit] = []
     seen_texts: set[str] = set()
-
-    for unit in safe_hits:
-        words = _content_tokens(unit.text)
-        if not (qtokens & words):
-            continue
-        if not _has_structured_anchor(question, unit.text):
-            continue
+    for _, _, unit in candidates:
         normalized = " ".join(unit.text.lower().split())
         if normalized in seen_texts:
             continue
         seen_texts.add(normalized)
         chosen.append(unit)
-        if len(chosen) == 3:
+        if len(chosen) == 4:
             break
-
-    if not chosen:
-        return "I don't know.", [], True
 
     snippets = [_compact_snippet(unit.text) for unit in chosen]
     answer = " ".join(snippet for snippet in snippets if snippet)
