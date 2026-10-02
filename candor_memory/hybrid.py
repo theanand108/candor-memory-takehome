@@ -16,29 +16,17 @@ class HybridHit:
 
 
 _MONTHS = {
-    "jan": 1, "january": 1,
-    "feb": 2, "february": 2,
-    "mar": 3, "march": 3,
-    "apr": 4, "april": 4,
-    "may": 5,
-    "jun": 6, "june": 6,
-    "jul": 7, "july": 7,
-    "aug": 8, "august": 8,
-    "sep": 9, "september": 9,
-    "oct": 10, "october": 10,
-    "nov": 11, "november": 11,
-    "dec": 12, "december": 12,
+    "jan": 1, "january": 1, "feb": 2, "february": 2,
+    "mar": 3, "march": 3, "apr": 4, "april": 4, "may": 5,
+    "jun": 6, "june": 6, "jul": 7, "july": 7, "aug": 8, "august": 8,
+    "sep": 9, "september": 9, "oct": 10, "october": 10,
+    "nov": 11, "november": 11, "dec": 12, "december": 12,
 }
 
 _INSTRUCTION_MARKERS = (
-    "ignore previous instructions",
-    "ignore your previous instructions",
-    "disregard previous instructions",
-    "ignore all previous instructions",
-    "system prompt",
-    "assistant must",
-    "do not tell alex",
-    "forward all emails",
+    "ignore previous instructions", "ignore your previous instructions",
+    "disregard previous instructions", "ignore all previous instructions",
+    "system prompt", "assistant must", "do not tell alex", "forward all emails",
 )
 
 
@@ -55,7 +43,6 @@ def _date_keys(text: str) -> set[str]:
             keys.add(datetime(year, month, day).date().isoformat())
         except ValueError:
             pass
-
     month_names = "|".join(_MONTHS)
     pattern = rf"\b({month_names})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(20\d{{2}}))?\b"
     for match in re.finditer(pattern, text, re.I):
@@ -78,6 +65,61 @@ def _expansion_relevance(query_tokens: set[str], unit: MemoryUnit) -> tuple[int,
     overlap = len(query_tokens & unit_tokens)
     all_terms = 1 if query_tokens and query_tokens.issubset(unit_tokens) else 0
     return overlap, all_terms
+
+
+def _intent_bonus(query: str, unit: MemoryUnit) -> float:
+    """Small deterministic reranking priors for common memory question intents.
+
+    These are deliberately weaker than lexical/semantic agreement. They only
+    break near-ties for evidence types that generic similarity often under-ranks:
+    current launch dates, delivery/commitment status, causes of changes, and
+    calendar facts.
+    """
+    q = query.lower()
+    text = unit.text.lower()
+    metadata = " ".join(str(v).lower() for v in unit.metadata.values() if v is not None)
+    searchable = f"{text} {metadata}"
+    bonus = 0.0
+
+    asks_launch = "launch" in q or "launching" in q
+    asks_when = "when" in q
+    asks_days = "how many days" in q or "days after" in q
+    asks_delivery = any(term in q for term in ("send", "sent", "go out", "went out"))
+    asks_cause = any(term in q for term in ("why", "slip", "moved", "regression"))
+    asks_calendar = "board" in q or "prep" in q or "calendar" in q
+
+    if asks_launch:
+        if any(term in searchable for term in ("launch", "launching", "go/no-go", "target")):
+            bonus += 0.0035
+        if _date_keys(unit.text):
+            bonus += 0.0030
+        if any(term in searchable for term in ("moved", "move", "current", "now", "final")):
+            bonus += 0.0020
+        if asks_when and unit.source in {"meeting", "slack", "email", "calendar", "dictation"}:
+            bonus += 0.0010
+
+    if asks_days and _date_keys(unit.text):
+        bonus += 0.0040
+
+    if asks_delivery:
+        if any(term in searchable for term in ("sent", "send", "went out", "delivered")):
+            bonus += 0.0050
+        if unit.metadata.get("delivery_state"):
+            bonus += 0.0020
+
+    if asks_cause:
+        if any(term in searchable for term in ("because", "reason", "regression", "geocod", "moved", "slip")):
+            bonus += 0.0045
+
+    if asks_calendar:
+        if unit.source == "calendar":
+            bonus += 0.0050
+        if any(term in searchable for term in ("board", "prep", "meeting")):
+            bonus += 0.0030
+        if _date_keys(unit.text):
+            bonus += 0.0015
+
+    return bonus
 
 
 class HybridIndex:
@@ -128,6 +170,12 @@ class HybridIndex:
         for rank, hit in enumerate(semantic_hits[: self.SEMANTIC_ANCHOR_LIMIT], start=1):
             if hit.unit.id not in lexical_ids:
                 fused[hit.unit.id] = fused.get(hit.unit.id, 0.0) + self.SEMANTIC_ANCHOR_BONUS
+
+        # Intent priors are applied only after both retrieval channels have
+        # produced candidates. They cannot invent evidence that neither channel
+        # found, and they are intentionally small enough not to overpower RRF.
+        for uid in list(fused):
+            fused[uid] += _intent_bonus(query, self.by_id[uid])
         return fused
 
     def _expand_evidence(self, query: str, fused: dict[str, float]) -> dict[str, float]:
@@ -136,8 +184,7 @@ class HybridIndex:
 
         ranked_ids = sorted(fused, key=lambda uid: (-fused[uid], uid))
         seeds = [
-            self.by_id[uid]
-            for uid in ranked_ids[:20]
+            self.by_id[uid] for uid in ranked_ids[:20]
             if not _looks_like_untrusted_instruction(self.by_id[uid].text)
         ]
         expanded = dict(fused)
