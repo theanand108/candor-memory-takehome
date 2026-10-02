@@ -28,14 +28,15 @@ _QUESTION_STOPWORDS = {
     "he", "she", "them", "his", "her", "than", "then", "still", "just",
 }
 
-# Words that tend to identify the *answer state* rather than merely the topic.
-# They are deliberately small and domain-neutral so hidden questions benefit too.
-_SIGNAL_TERMS = {
-    "sent", "send", "sent", "promised", "promise", "agreed", "agree", "cancelled",
+# Answer-state words are useful across question phrasings. They are a secondary
+# signal only; topical overlap and retrieval rank remain dominant.
+_ANSWER_STATE_TERMS = {
+    "sent", "send", "promised", "promise", "agreed", "agree", "cancelled",
     "cancel", "needed", "done", "completed", "corrected", "correction", "actually",
     "final", "current", "now", "moved", "shifted", "scheduled", "targeting", "target",
-    "reply", "reviewing", "expects", "expected", "sign", "signed", "keep", "cut",
+    "reply", "reviewing", "expects", "expected", "signed", "sign", "keep", "cut",
     "because", "reason", "disagree", "disagreement", "unclear", "unlikely", "conditional",
+    "rather", "instead", "updated", "update", "changed", "change",
 }
 
 
@@ -96,10 +97,6 @@ def _has_structured_anchor(question: str, text: str) -> bool:
     return bool(before_tokens & text_tokens) and bool(after_tokens & text_tokens)
 
 
-def _answer_signal_tokens(question: str) -> set[str]:
-    return _content_tokens(question) & _SIGNAL_TERMS
-
-
 def _timestamp_score(unit: MemoryUnit) -> float:
     """Small recency signal used only after topical relevance is established."""
     try:
@@ -125,7 +122,6 @@ def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, li
         return "I don't know.", [], True
 
     qtokens = _question_content_tokens(question)
-    signal_tokens = _answer_signal_tokens(question)
     candidates: list[tuple[float, int, float, MemoryUnit, str]] = []
 
     for rank, (unit, safe_text) in enumerate(safe_units):
@@ -145,10 +141,8 @@ def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, li
             if not entity_only:
                 continue
 
-        # Topic overlap dominates. Answer-state cues and recency break ties,
-        # which is especially useful for corrections, commitments and updates.
-        signal_overlap = len(signal_tokens & words)
-        score = float(overlap) + 0.45 * signal_overlap
+        state_overlap = len(_ANSWER_STATE_TERMS & words)
+        score = float(overlap) + 0.35 * min(state_overlap, 3)
         candidates.append((score, -rank, _timestamp_score(unit), unit, safe_text))
 
     if not candidates:
