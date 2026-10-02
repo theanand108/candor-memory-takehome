@@ -131,6 +131,8 @@ class HybridIndex:
 
         # 1. Same record/thread: meetings, Slack threads, Gmail threads and
         # other grouped records often split one fact across many short units.
+        # Keep this relationship useful without allowing a single seed to
+        # flood the final ranking with loosely related sibling segments.
         # Never create new retrieval paths from instruction-bearing content.
         for seed in seeds:
             for unit in self.by_record.get(seed.record_id, []):
@@ -138,7 +140,7 @@ class HybridIndex:
                     continue
                 expanded[unit.id] = max(
                     expanded.get(unit.id, 0.0),
-                    fused[seed.id] * 0.82,
+                    fused[seed.id] * 0.65,
                 )
 
             target_id = seed.metadata.get("target_id")
@@ -159,7 +161,7 @@ class HybridIndex:
                     ):
                         expanded[unit.id] = max(
                             expanded.get(unit.id, 0.0),
-                            fused[seed.id] * 0.80,
+                            fused[seed.id] * 0.65,
                         )
 
         # 2. Date hop: if a seed mentions a concrete date, retrieve calendar
