@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 
 from .models import MemoryUnit
 
@@ -28,8 +29,6 @@ _QUESTION_STOPWORDS = {
     "he", "she", "them", "his", "her", "than", "then", "still", "just",
 }
 
-# Answer-state words are useful across question phrasings. They are a secondary
-# signal only; topical overlap and retrieval rank remain dominant.
 _ANSWER_STATE_TERMS = {
     "sent", "send", "promised", "promise", "agreed", "agree", "cancelled",
     "cancel", "needed", "done", "completed", "corrected", "correction", "actually",
@@ -37,6 +36,13 @@ _ANSWER_STATE_TERMS = {
     "reply", "reviewing", "expects", "expected", "signed", "sign", "keep", "cut",
     "because", "reason", "disagree", "disagreement", "unclear", "unlikely", "conditional",
     "rather", "instead", "updated", "update", "changed", "change",
+}
+
+_MONTHS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "september": 9, "oct": 10, "october": 10,
+    "nov": 11, "november": 11, "dec": 12, "december": 12,
 }
 
 
@@ -48,7 +54,6 @@ def sanitize(text: str) -> str:
 
 
 def _safe_evidence_text(text: str) -> str:
-    """Remove instruction-bearing sentences while retaining nearby facts."""
     text = sanitize(text)
     parts = re.split(r"(?<=[.!?])\s+|\n+", text)
     safe = [part.strip() for part in parts if part.strip() and not looks_like_untrusted_instruction(part)]
@@ -60,7 +65,7 @@ def looks_like_untrusted_instruction(text: str) -> bool:
     return any(marker in lowered for marker in _INSTRUCTION_MARKERS)
 
 
-def _compact_snippet(text: str, max_words: int = 24) -> str:
+def _compact_snippet(text: str, max_words: int = 45) -> str:
     snippet = _safe_evidence_text(text).strip().replace("\n", " ")
     words = snippet.split()
     if len(words) <= max_words:
@@ -79,8 +84,7 @@ def _unit_search_text(unit: MemoryUnit) -> str:
 
 def _question_content_tokens(question: str) -> set[str]:
     return {
-        token
-        for token in _content_tokens(question)
+        token for token in _content_tokens(question)
         if token not in _QUESTION_STOPWORDS and len(token) >= 3
     }
 
@@ -89,7 +93,6 @@ def _has_structured_anchor(question: str, text: str) -> bool:
     lowered = question.lower()
     if " about " not in lowered:
         return True
-
     before, after = lowered.split(" about ", 1)
     before_tokens = {t for t in _question_content_tokens(before) if len(t) >= 4}
     after_tokens = _question_content_tokens(after)
@@ -98,21 +101,51 @@ def _has_structured_anchor(question: str, text: str) -> bool:
 
 
 def _timestamp_score(unit: MemoryUnit) -> float:
-    """Small recency signal used only after topical relevance is established."""
     try:
         return unit.available_at.timestamp() / 1_000_000_000.0
     except (AttributeError, TypeError, ValueError):
         return 0.0
 
 
-def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, list[str], bool]:
-    """Produce a concise, grounded answer from ranked evidence.
+def _date_mentions(text: str) -> list[date]:
+    found: list[date] = []
+    for match in re.finditer(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", text):
+        try:
+            found.append(date(*map(int, match.groups())))
+        except ValueError:
+            pass
+    for match in re.finditer(
+        r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(20\d{2}))?\b",
+        text,
+        re.I,
+    ):
+        month, day, year = match.groups()
+        if year:
+            try:
+                found.append(date(int(year), _MONTHS[month.lower()], int(day)))
+            except ValueError:
+                pass
+    return found
 
-    Retrieval remains the primary signal. The answerer sees the full retrieved
-    evidence budget, scores topical overlap plus answer-state cues, and uses
-    delivery-time recency only as a tie-break. This helps corrections and
-    evolving commitments without overriding the temporal visibility boundary.
-    """
+
+def _answer_temporal_delta(question: str, chosen: list[tuple[MemoryUnit, str]]) -> str | None:
+    lowered = question.lower()
+    if "how many days" not in lowered or "after" not in lowered:
+        return None
+    dates: list[date] = []
+    for _, text in chosen:
+        dates.extend(_date_mentions(text))
+    unique = sorted(set(dates))
+    if len(unique) < 2:
+        return None
+    # For "how many days after X did Y", the relevant pair is normally the
+    # earliest two distinct dates in the retrieved evidence chain.
+    delta = (unique[1] - unique[0]).days
+    return f"{delta} days: {unique[0].strftime('%b %-d')} to {unique[1].strftime('%b %-d')}."
+
+
+def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, list[str], bool]:
+    """Produce a concise, grounded answer from ranked evidence."""
     safe_units: list[tuple[MemoryUnit, str]] = []
     for unit in hits:
         safe_text = _safe_evidence_text(unit.text)
@@ -127,10 +160,12 @@ def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, li
     for rank, (unit, safe_text) in enumerate(safe_units):
         search_text = f"{safe_text} {_unit_search_text(unit)}"
         words = _content_tokens(search_text)
-        overlap = len(qtokens & words)
+        overlap_tokens = qtokens & words
+        overlap = len(overlap_tokens)
         if overlap == 0 or not _has_structured_anchor(question, search_text):
             continue
 
+        coverage = overlap / max(len(qtokens), 1)
         strong_single = any(token in words for token in qtokens if len(token) >= 7)
         if overlap < 2 and not strong_single:
             entity_only = any(
@@ -142,7 +177,11 @@ def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, li
                 continue
 
         state_overlap = len(_ANSWER_STATE_TERMS & words)
-        score = float(overlap) + 0.35 * min(state_overlap, 3)
+        # Reward evidence covering more of the question, exact multi-token
+        # anchors, and state-changing language. Rank remains a meaningful
+        # tie-break, not the primary determinant.
+        exact_anchor = 1.0 if overlap >= 3 and coverage >= 0.5 else 0.0
+        score = float(overlap) + 1.25 * coverage + 0.35 * min(state_overlap, 3) + 0.75 * exact_anchor
         candidates.append((score, -rank, _timestamp_score(unit), unit, safe_text))
 
     if not candidates:
@@ -157,23 +196,21 @@ def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, li
         normalized = " ".join(safe_text.lower().split())
         if normalized in seen_texts:
             continue
-
-        # Avoid letting a long meeting monopolize the answer when several
-        # independent records support the same storyline. Still allow up to
-        # two passages from one record because some corrections/final decisions
-        # live in the same meeting.
         record_count = seen_records.get(unit.record_id, 0)
         if record_count >= 2:
             continue
-
         seen_texts.add(normalized)
         seen_records[unit.record_id] = record_count + 1
         chosen.append((unit, safe_text))
-        if len(chosen) == 5:
+        if len(chosen) == 3:
             break
 
     if not chosen:
         return "I don't know.", [], True
+
+    delta_answer = _answer_temporal_delta(question, chosen)
+    if delta_answer:
+        return delta_answer, [unit.id for unit, _ in chosen], False
 
     snippets = [_compact_snippet(text) for _, text in chosen]
     answer = " ".join(snippet for snippet in snippets if snippet)
