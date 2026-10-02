@@ -48,7 +48,6 @@ def _looks_like_untrusted_instruction(text: str) -> bool:
 
 
 def _date_keys(text: str) -> set[str]:
-    """Return normalized YYYY-MM-DD keys mentioned in a memory passage."""
     keys: set[str] = set()
 
     for match in re.finditer(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", text):
@@ -62,11 +61,10 @@ def _date_keys(text: str) -> set[str]:
     pattern = rf"\b({month_names})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(20\d{{2}}))?\b"
     for match in re.finditer(pattern, text, re.I):
         month, day, year = match.groups()
-        year_i = int(year) if year else None
-        if year_i is None:
+        if year is None:
             continue
         try:
-            keys.add(datetime(year_i, _MONTHS[month.lower()], int(day)).date().isoformat())
+            keys.add(datetime(int(year), _MONTHS[month.lower()], int(day)).date().isoformat())
         except ValueError:
             pass
 
@@ -79,9 +77,9 @@ class HybridIndex:
     RRF_K = 60.0
     CANDIDATE_LIMIT = 60
     LEXICAL_ANCHOR_LIMIT = 5
-    # Strong enough to preserve rare exact lexical anchors that dense retrieval
-    # omits, while still much smaller than a full lexical-score override.
+    SEMANTIC_ANCHOR_LIMIT = 10
     LEXICAL_ANCHOR_BONUS = 0.0065
+    SEMANTIC_ANCHOR_BONUS = 0.0045
 
     def __init__(self, units: list[MemoryUnit]):
         self.units = units
@@ -111,20 +109,23 @@ class HybridIndex:
         for rank, hit in enumerate(semantic_hits, start=1):
             fused[hit.unit.id] = fused.get(hit.unit.id, 0.0) + 1.0 / (self.RRF_K + rank)
 
-        # Protect a small number of strong lexical-only anchors. These are
-        # useful when a query contains exact entities/phrases that dense
-        # retrieval misses. The bonus is deliberately small and applies only
-        # to lexical top-5 results absent from the semantic candidate set, so
-        # it does not globally tilt hybrid retrieval back toward lexical search.
         semantic_ids = {hit.unit.id for hit in semantic_hits}
         for rank, hit in enumerate(lexical_hits[: self.LEXICAL_ANCHOR_LIMIT], start=1):
             if hit.unit.id not in semantic_ids:
                 fused[hit.unit.id] = fused.get(hit.unit.id, 0.0) + self.LEXICAL_ANCHOR_BONUS
 
+        # The reciprocal-rank sum can otherwise let several merely related
+        # lexical records crowd out a high-quality semantic-only hit. Preserve
+        # a small semantic frontier as an anchor; later evidence expansion can
+        # still supply the precise neighboring records.
+        lexical_ids = {hit.unit.id for hit in lexical_hits}
+        for rank, hit in enumerate(semantic_hits[: self.SEMANTIC_ANCHOR_LIMIT], start=1):
+            if hit.unit.id not in lexical_ids:
+                fused[hit.unit.id] = fused.get(hit.unit.id, 0.0) + self.SEMANTIC_ANCHOR_BONUS
+
         return fused
 
     def _expand_evidence(self, query: str, fused: dict[str, float]) -> dict[str, float]:
-        """Expand from strong seeds into deterministic related evidence."""
         if not fused:
             return fused
 
@@ -140,19 +141,13 @@ class HybridIndex:
             for unit in self.by_record.get(seed.record_id, []):
                 if unit.id == seed.id or _looks_like_untrusted_instruction(unit.text):
                     continue
-                expanded[unit.id] = max(
-                    expanded.get(unit.id, 0.0),
-                    fused[seed.id] * 0.65,
-                )
+                expanded[unit.id] = max(expanded.get(unit.id, 0.0), fused[seed.id] * 0.65)
 
             target_id = seed.metadata.get("target_id")
             if target_id and target_id in self.by_id:
                 target = self.by_id[target_id]
                 if not _looks_like_untrusted_instruction(target.text):
-                    expanded[target_id] = max(
-                        expanded.get(target_id, 0.0),
-                        fused[seed.id] * 0.88,
-                    )
+                    expanded[target_id] = max(expanded.get(target_id, 0.0), fused[seed.id] * 0.88)
 
             thread_parent = seed.metadata.get("thread_parent_id")
             if thread_parent:
@@ -161,10 +156,7 @@ class HybridIndex:
                         unit.metadata.get("thread_parent_id") == thread_parent
                         and not _looks_like_untrusted_instruction(unit.text)
                     ):
-                        expanded[unit.id] = max(
-                            expanded.get(unit.id, 0.0),
-                            fused[seed.id] * 0.65,
-                        )
+                        expanded[unit.id] = max(expanded.get(unit.id, 0.0), fused[seed.id] * 0.65)
 
         date_keys: set[str] = set()
         for seed in seeds:
@@ -174,12 +166,8 @@ class HybridIndex:
             for unit in self.units:
                 if unit.source != "calendar" or _looks_like_untrusted_instruction(unit.text):
                     continue
-                unit_dates = _date_keys(unit.text)
-                if date_keys & unit_dates:
-                    expanded[unit.id] = max(
-                        expanded.get(unit.id, 0.0),
-                        0.0105,
-                    )
+                if date_keys & _date_keys(unit.text):
+                    expanded[unit.id] = max(expanded.get(unit.id, 0.0), 0.0105)
 
         return expanded
 
@@ -189,13 +177,6 @@ class HybridIndex:
 
         ranked = sorted(
             fused.items(),
-            key=lambda item: (
-                -item[1],
-                self.by_id[item[0]].available_at,
-                item[0],
-            ),
+            key=lambda item: (-item[1], self.by_id[item[0]].available_at, item[0]),
         )
-        return [
-            HybridHit(self.by_id[uid], score)
-            for uid, score in ranked[:limit]
-        ]
+        return [HybridHit(self.by_id[uid], score) for uid, score in ranked[:limit]]
