@@ -30,8 +30,7 @@ _ANSWER_STATE_TERMS = {
     "final", "current", "now", "moved", "shifted", "scheduled", "targeting", "target",
     "reply", "reviewing", "expects", "expected", "signed", "sign", "keep", "cut",
     "because", "reason", "disagree", "disagreement", "unclear", "unlikely", "conditional",
-    "rather", "instead", "updated", "update", "changed", "change", "extension", "board",
-    "geocoding", "geocoder", "not", "never",
+    "rather", "instead", "updated", "update", "changed", "change",
 }
 
 _MONTHS = {
@@ -135,34 +134,8 @@ def _sentences(text: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def _trim_preserving_decisive(question: str, sentence: str, max_words: int) -> str:
-    """Trim a long sentence around its most informative region, not blindly from the front."""
-    words = sentence.split()
-    if len(words) <= max_words:
-        return sentence
-    qtokens = _question_content_tokens(question)
-    tokenized = [_content_tokens(word) for word in words]
-    best_start = 0
-    best_score = float("-inf")
-    window = max_words
-    for start in range(len(words) - window + 1):
-        window_tokens = set().union(*tokenized[start:start + window])
-        overlap = len(qtokens & window_tokens)
-        state = len(_ANSWER_STATE_TERMS & window_tokens)
-        dates = len(_date_mentions(" ".join(words[start:start + window])))
-        numbers = len(re.findall(r"\b\d+(?:\.\d+)?\b", " ".join(words[start:start + window])))
-        score = overlap + 1.0 * state + 1.25 * dates + 0.5 * min(numbers, 3)
-        if score > best_score:
-            best_score = score
-            best_start = start
-    end = best_start + window
-    prefix = "... " if best_start else ""
-    suffix = " ..." if end < len(words) else ""
-    return prefix + " ".join(words[best_start:end]).rstrip(".,;:") + suffix
-
-
 def _decisive_snippet(question: str, unit: MemoryUnit, text: str, max_words: int = 45) -> str:
-    """Select decisive sentences while preserving dates, quantities, entities, and state changes."""
+    """Select decisive sentences while preserving dates, quantities, and state changes."""
     sentences = _sentences(text)
     if not sentences:
         return ""
@@ -174,8 +147,7 @@ def _decisive_snippet(question: str, unit: MemoryUnit, text: str, max_words: int
         state = len(_ANSWER_STATE_TERMS & tokens)
         dates = len(_date_mentions(sentence))
         value_signal = len(re.findall(r"(?:\$\s?\d|\b\d+(?:\.\d+)?\b|%|ms\b|seconds?\b|vehicles?\b)", sentence.lower()))
-        named_entity_signal = len(re.findall(r"\b[A-Z][a-z]{2,}\b", sentence))
-        score = overlap + 0.8 * state + 0.8 * dates + 0.8 * min(value_signal, 3) + 0.15 * min(named_entity_signal, 5)
+        score = overlap + 0.6 * state + 0.6 * dates + 0.7 * min(value_signal, 3)
         if unit.metadata.get("speaker") and unit.metadata.get("speaker", "").lower() in sentence.lower():
             score += 0.75
         scored.append((score, -idx, sentence))
@@ -184,18 +156,17 @@ def _decisive_snippet(question: str, unit: MemoryUnit, text: str, max_words: int
     selected: list[str] = []
     words = 0
     for _, _, sentence in scored:
-        trimmed = _trim_preserving_decisive(question, sentence, max_words)
-        n = len(trimmed.split())
+        n = len(sentence.split())
         if not selected and n > max_words:
-            selected.append(trimmed)
+            selected.append(" ".join(sentence.split()[:max_words]).rstrip(".,;:") + "...")
             break
         if words + n <= max_words:
-            selected.append(trimmed)
+            selected.append(sentence)
             words += n
         if len(selected) >= 2:
             break
     if len(selected) == 2:
-        selected.sort(key=lambda s: next((i for i, original in enumerate(sentences) if s.strip("... ") in original), 0))
+        selected.sort(key=lambda s: sentences.index(s))
     return " ".join(selected)
 
 
