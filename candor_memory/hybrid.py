@@ -79,7 +79,9 @@ class HybridIndex:
     RRF_K = 60.0
     CANDIDATE_LIMIT = 60
     LEXICAL_ANCHOR_LIMIT = 5
-    LEXICAL_ANCHOR_BONUS = 0.0035
+    # Strong enough to preserve rare exact lexical anchors that dense retrieval
+    # omits, while still much smaller than a full lexical-score override.
+    LEXICAL_ANCHOR_BONUS = 0.0065
 
     def __init__(self, units: list[MemoryUnit]):
         self.units = units
