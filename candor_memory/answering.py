@@ -47,6 +47,29 @@ def _compact_snippet(text: str, max_words: int = 38) -> str:
     return " ".join(words[:max_words]).rstrip(".,;:") + "..."
 
 
+def _content_tokens(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _has_structured_anchor(question: str, text: str) -> bool:
+    """Require both sides of a question's explicit 'about' relation.
+
+    This prevents an unrelated record about the right entity from becoming an
+    answer merely because it shares one broad subject token. It is especially
+    useful for questions asking what an entity said about a specific topic.
+    """
+    lowered = question.lower()
+    if " about " not in lowered:
+        return True
+
+    before, after = lowered.split(" about ", 1)
+    before_tokens = {t for t in _content_tokens(before) if len(t) >= 4}
+    after_tokens = {t for t in _content_tokens(after) if len(t) >= 3}
+    text_tokens = _content_tokens(text)
+
+    return bool(before_tokens & text_tokens) and bool(after_tokens & text_tokens)
+
+
 def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, list[str], bool]:
     """Return a conservative extractive answer from retrieval-ranked evidence.
 
@@ -63,13 +86,15 @@ def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, li
     if not safe_hits:
         return "I don't know.", [], True
 
-    qtokens = set(re.findall(r"[a-z0-9]+", question.lower()))
+    qtokens = _content_tokens(question)
     chosen: list[MemoryUnit] = []
     seen_texts: set[str] = set()
 
     for unit in safe_hits:
-        words = set(re.findall(r"[a-z0-9]+", unit.text.lower()))
+        words = _content_tokens(unit.text)
         if not (qtokens & words):
+            continue
+        if not _has_structured_anchor(question, unit.text):
             continue
         normalized = " ".join(unit.text.lower().split())
         if normalized in seen_texts:
