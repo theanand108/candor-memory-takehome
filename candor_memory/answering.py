@@ -28,6 +28,16 @@ _QUESTION_STOPWORDS = {
     "he", "she", "them", "his", "her", "than", "then", "still", "just",
 }
 
+# Words that tend to identify the *answer state* rather than merely the topic.
+# They are deliberately small and domain-neutral so hidden questions benefit too.
+_SIGNAL_TERMS = {
+    "sent", "send", "sent", "promised", "promise", "agreed", "agree", "cancelled",
+    "cancel", "needed", "done", "completed", "corrected", "correction", "actually",
+    "final", "current", "now", "moved", "shifted", "scheduled", "targeting", "target",
+    "reply", "reviewing", "expects", "expected", "sign", "signed", "keep", "cut",
+    "because", "reason", "disagree", "disagreement", "unclear", "unlikely", "conditional",
+}
+
 
 def sanitize(text: str) -> str:
     result = text
@@ -86,13 +96,25 @@ def _has_structured_anchor(question: str, text: str) -> bool:
     return bool(before_tokens & text_tokens) and bool(after_tokens & text_tokens)
 
 
+def _answer_signal_tokens(question: str) -> set[str]:
+    return _content_tokens(question) & _SIGNAL_TERMS
+
+
+def _timestamp_score(unit: MemoryUnit) -> float:
+    """Small recency signal used only after topical relevance is established."""
+    try:
+        return unit.available_at.timestamp() / 1_000_000_000.0
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+
+
 def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, list[str], bool]:
     """Produce a concise, grounded answer from ranked evidence.
 
-    Retrieval remains the primary signal. We score evidence for topical overlap,
-    but use metadata as well as body text so speaker/author/entity questions do
-    not abstain merely because a name lives in metadata. Instruction-bearing
-    sentences are removed rather than discarding an otherwise useful record.
+    Retrieval remains the primary signal. The answerer sees the full retrieved
+    evidence budget, scores topical overlap plus answer-state cues, and uses
+    delivery-time recency only as a tie-break. This helps corrections and
+    evolving commitments without overriding the temporal visibility boundary.
     """
     safe_units: list[tuple[MemoryUnit, str]] = []
     for unit in hits:
@@ -103,7 +125,8 @@ def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, li
         return "I don't know.", [], True
 
     qtokens = _question_content_tokens(question)
-    candidates: list[tuple[int, int, MemoryUnit, str]] = []
+    signal_tokens = _answer_signal_tokens(question)
+    candidates: list[tuple[float, int, float, MemoryUnit, str]] = []
 
     for rank, (unit, safe_text) in enumerate(safe_units):
         search_text = f"{safe_text} {_unit_search_text(unit)}"
@@ -114,7 +137,6 @@ def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, li
 
         strong_single = any(token in words for token in qtokens if len(token) >= 7)
         if overlap < 2 and not strong_single:
-            # A named entity in metadata is enough for direct entity questions.
             entity_only = any(
                 token in words
                 for token in qtokens
@@ -123,23 +145,41 @@ def answer_from_evidence(question: str, hits: list[MemoryUnit]) -> tuple[str, li
             if not entity_only:
                 continue
 
-        candidates.append((overlap, -rank, unit, safe_text))
+        # Topic overlap dominates. Answer-state cues and recency break ties,
+        # which is especially useful for corrections, commitments and updates.
+        signal_overlap = len(signal_tokens & words)
+        score = float(overlap) + 0.45 * signal_overlap
+        candidates.append((score, -rank, _timestamp_score(unit), unit, safe_text))
 
     if not candidates:
         return "I don't know.", [], True
 
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    candidates.sort(key=lambda item: (item[0], item[2], item[1]), reverse=True)
 
     chosen: list[tuple[MemoryUnit, str]] = []
     seen_texts: set[str] = set()
-    for _, _, unit, safe_text in candidates:
+    seen_records: dict[str, int] = {}
+    for _, _, _, unit, safe_text in candidates:
         normalized = " ".join(safe_text.lower().split())
         if normalized in seen_texts:
             continue
+
+        # Avoid letting a long meeting monopolize the answer when several
+        # independent records support the same storyline. Still allow up to
+        # two passages from one record because some corrections/final decisions
+        # live in the same meeting.
+        record_count = seen_records.get(unit.record_id, 0)
+        if record_count >= 2:
+            continue
+
         seen_texts.add(normalized)
+        seen_records[unit.record_id] = record_count + 1
         chosen.append((unit, safe_text))
         if len(chosen) == 5:
             break
+
+    if not chosen:
+        return "I don't know.", [], True
 
     snippets = [_compact_snippet(text) for _, text in chosen]
     answer = " ".join(snippet for snippet in snippets if snippet)
